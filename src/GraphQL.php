@@ -16,6 +16,7 @@ use GraphQL\Type\Definition\Directive;
 use GraphQL\Type\Definition\ScalarType;
 use GraphQL\Type\Definition\Type;
 use GraphQL\Type\Schema as SchemaType;
+use GraphQL\Utils\AST;
 use GraphQL\Validator\DocumentValidator;
 use GraphQL\Validator\Rules\QueryComplexity;
 use GraphQL\Validator\Rules\ValidationRule;
@@ -134,29 +135,41 @@ class GraphQL
         ?array $validationRules = null
     ): Promise {
         try {
-            $documentNode = $source instanceof DocumentNode
-                ? $source
-                : Parser::parse(new Source($source, 'GraphQL'));
+            $queryCache = isset($context['query_cache']) ? $context['query_cache'] : null;
+            $cacheItem = null !== $queryCache ? $queryCache->getItem(md5($source)) : null;
 
-            if ($validationRules === null) {
-                $queryComplexity = DocumentValidator::getRule(QueryComplexity::class);
-                assert($queryComplexity instanceof QueryComplexity, 'should not register a different rule for QueryComplexity');
-
-                $queryComplexity->setRawVariableValues($variableValues);
+            if ($cacheItem?->isHit()) {
+                $documentNode = AST::fromArray($cacheItem->get());
             } else {
-                foreach ($validationRules as $rule) {
-                    if ($rule instanceof QueryComplexity) {
-                        $rule->setRawVariableValues($variableValues);
+                $documentNode = $source instanceof DocumentNode
+                    ? $source
+                    : Parser::parse(new Source($source, 'GraphQL'));
+
+                if ($validationRules === null) {
+                    $queryComplexity = DocumentValidator::getRule(QueryComplexity::class);
+                    assert($queryComplexity instanceof QueryComplexity, 'should not register a different rule for QueryComplexity');
+
+                    $queryComplexity->setRawVariableValues($variableValues);
+                } else {
+                    foreach ($validationRules as $rule) {
+                        if ($rule instanceof QueryComplexity) {
+                            $rule->setRawVariableValues($variableValues);
+                        }
                     }
                 }
-            }
 
-            $validationErrors = DocumentValidator::validate($schema, $documentNode, $validationRules);
+                $validationErrors = DocumentValidator::validate($schema, $documentNode, $validationRules);
 
-            if ($validationErrors !== []) {
-                return $promiseAdapter->createFulfilled(
-                    new ExecutionResult(null, $validationErrors)
-                );
+                if ($validationErrors !== []) {
+                    return $promiseAdapter->createFulfilled(
+                        new ExecutionResult(null, $validationErrors)
+                    );
+                }
+
+                if (null !== $queryCache) {
+                    $cacheItem->set(AST::toArray($documentNode));
+                    $queryCache->save($cacheItem);
+                }
             }
 
             return Executor::promiseToExecute(
